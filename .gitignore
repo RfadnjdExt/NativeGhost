@@ -1,0 +1,10 @@
+target/
+__pycache__/
+*.gz
+extracted_apk/
+extracted_zlib_resources/
+crash_dump.txt
+output.txt
+test.txt
+*.luac
+heap_strings.txt
