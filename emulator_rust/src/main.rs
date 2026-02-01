@@ -2,6 +2,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, BufRead, Write};
+use std::net::Ipv4Addr;
 use unicorn_engine::unicorn_const::{self as uc_const, Prot};
 use unicorn_engine::{Context, RegisterARM64, Unicorn};
 
@@ -37,6 +38,82 @@ struct EmulatorState {
     threads: Vec<Thread>,
     current_thread_idx: usize,
     next_tid: u32,
+    last_log: String,
+    log_count: u32,
+    mapped_pages: u64,
+    simulate_live_list: bool,
+    simulate_live_list_remaining: usize,
+    simulate_seed: u64,
+    auto_restart: bool,
+    restart_limit: u32,
+    restart_count: u32,
+    ignore_exceptions: bool,
+    exception_skip_limit: u32,
+    exception_skip_count: u32,
+}
+
+fn lcg_next(seed: &mut u64) -> u64 {
+    // 64-bit LCG constants (numerical recipes style)
+    *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    *seed
+}
+
+fn build_fake_live_list_json(seed: &mut u64, count: usize) -> String {
+    let categories = ["Popular", "Hero", "New", "Pro", "Nearby", "Ranked"];
+    let regions = ["ID", "SG", "TH", "VN", "PH", "MY", "BR", "MX", "TR"];
+    let mut items = Vec::with_capacity(count);
+
+    for i in 0..count {
+        let r1 = lcg_next(seed);
+        let r2 = lcg_next(seed);
+        let r3 = lcg_next(seed);
+        let viewers = (r1 % 2_500_000) + 100;
+        let duration = (r2 % 7_200) + 30;
+        let streamer_id = format!("{}{}{}", (r3 % 900_000) + 100_000, i, (r2 % 97));
+        let category = categories[(r2 as usize) % categories.len()];
+        let region = regions[(r1 as usize) % regions.len()];
+        let room_id = format!("{}", (r3 % 9_000_000) + 1_000_000);
+
+        items.push(format!(
+            "{{\"streamer_id\":\"{}\",\"room_id\":\"{}\",\"category\":\"{}\",\"region\":\"{}\",\"viewers\":{},\"duration_seconds\":{}}}",
+            streamer_id, room_id, category, region, viewers, duration
+        ));
+    }
+
+    format!("{{\"live_list\":[{}],\"source\":\"emulator\",\"timestamp\":\"{}\"}}", items.join(","), chrono_timestamp())
+}
+
+fn chrono_timestamp() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let secs = now.as_secs();
+    format!("{}", secs)
+}
+
+fn reset_main_thread(
+    uc: &mut Unicorn<EmulatorState>,
+    entry: u64,
+    stack_top: u64,
+    jvm_base: u64,
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    uc.reg_write(RegisterARM64::X0, jvm_base)?; // vm
+    uc.reg_write(RegisterARM64::X1, 0)?; // reserved
+    uc.reg_write(RegisterARM64::SP, stack_top)?;
+    uc.reg_write(RegisterARM64::PC, entry)?;
+    uc.reg_write(RegisterARM64::LR, 0x30000000)?; // EXIT MAGIC
+    uc.reg_write(RegisterARM64::CPACR_EL1, 0x300000)?; // VFP
+    uc.reg_write(RegisterARM64::TPIDR_EL0, HEAP_START + 0x100000)?; // TLS
+
+    uc.get_data_mut().threads.clear();
+    uc.get_data_mut().threads.push(Thread {
+        tid: 0,
+        context: None,
+        stack_base: STACK_BASE,
+        status: ThreadStatus::Running,
+    });
+    uc.get_data_mut().current_thread_idx = 0;
+    uc.get_data_mut().exception_skip_count = 0;
+    Ok(())
 }
 
 fn scan_memory_for_strings(uc: &Unicorn<EmulatorState>) {
@@ -68,6 +145,13 @@ fn print_strings(data: &[u8], region: &str) {
                     || s.contains("sign")
                     || s.contains("token")
                     || s.contains("Bearer")
+                    || s.to_lowercase().contains("live")
+                    || s.to_lowercase().contains("stream")
+                    || s.to_lowercase().contains("streamer")
+                    || s.to_lowercase().contains("room")
+                    || s.to_lowercase().contains("anchor")
+                    || s.to_lowercase().contains("popular")
+                    || s.to_lowercase().contains("hot")
                 {
                     println!("[Found in {}] {}", region, s);
                 }
@@ -80,6 +164,48 @@ fn print_strings(data: &[u8], region: &str) {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Init Rust Emulator (Multi-Threaded)...");
+
+    let mut simulate_live_list = false;
+    let mut simulate_live_list_count: usize = 20;
+    let mut auto_restart = false;
+    let mut restart_limit: u32 = 5;
+    let mut ignore_exceptions = false;
+    let mut exception_skip_limit: u32 = 200;
+    let mut entry_override: Option<u64> = None;
+    let mut entry_offset_override: Option<u64> = None;
+    for arg in std::env::args().skip(1) {
+        if arg == "--simulate-live-list" {
+            simulate_live_list = true;
+        } else if let Some(v) = arg.strip_prefix("--simulate-live-list=") {
+            if let Ok(n) = v.parse::<usize>() {
+                simulate_live_list = true;
+                simulate_live_list_count = n.max(1).min(200);
+            }
+        } else if arg == "--auto-restart" {
+            auto_restart = true;
+        } else if let Some(v) = arg.strip_prefix("--restart-limit=") {
+            if let Ok(n) = v.parse::<u32>() {
+                restart_limit = n.max(1).min(100);
+            }
+        } else if arg == "--ignore-exceptions" {
+            ignore_exceptions = true;
+        } else if let Some(v) = arg.strip_prefix("--exception-skip-limit=") {
+            if let Ok(n) = v.parse::<u32>() {
+                exception_skip_limit = n.max(1).min(10_000);
+            }
+        } else if let Some(v) = arg.strip_prefix("--entry=") {
+            if let Ok(parsed) = u64::from_str_radix(v.trim_start_matches("0x"), 16) {
+                entry_override = Some(parsed);
+            }
+        } else if let Some(v) = arg.strip_prefix("--entry-offset=") {
+            if let Ok(parsed) = u64::from_str_radix(v.trim_start_matches("0x"), 16) {
+                entry_offset_override = Some(parsed);
+            }
+        }
+    }
+    if simulate_live_list {
+        auto_restart = true;
+    }
 
     // Load Imports
     let imports_path = "../imports_map.txt";
@@ -102,7 +228,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Load Binary (Relocated Dump)
     let lib_path = "../memory_dump.bin";
-    let code = fs::read(lib_path).expect("Failed to read memory_dump.bin");
+    let code = match fs::read(lib_path) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            if simulate_live_list {
+                eprintln!("[WARN] memory_dump.bin not found ({}). Running in simulate-only mode.", e);
+                let mut seed = 0xC0FFEE_u64;
+                let payload = build_fake_live_list_json(&mut seed, simulate_live_list_count);
+                println!("[SIMULATED LIVE LIST]\n{}", payload);
+                let _ = std::fs::write("simulated_live_list.json", payload);
+                return Ok(());
+            }
+            return Err(Box::new(e));
+        }
+    };
 
     // Init State
     let mut state = EmulatorState {
@@ -113,6 +252,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         threads: Vec::new(),
         current_thread_idx: 0,
         next_tid: 1, // Main is 0
+        last_log: String::new(),
+        log_count: 0,
+        mapped_pages: 0,
+        simulate_live_list,
+        simulate_live_list_remaining: simulate_live_list_count,
+        simulate_seed: 0xC0FFEE_u64,
+        auto_restart,
+        restart_limit,
+        restart_count: 0,
+        ignore_exceptions,
+        exception_skip_limit,
+        exception_skip_count: 0,
     };
 
     // Add Main Thread
@@ -415,6 +566,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // println!("[OS] Segmentation Fault at PC={:x} accessing {:x}", pc, addr);
         // println!("[OS] Auto-mapping Unmapped Memory: {:x}", base);
+
+        {
+            let data = uc.get_data_mut();
+            data.mapped_pages += 1;
+            if data.mapped_pages > 262144 {
+                // 1GB limit
+                println!(
+                    "[Protection] OOM Prevention: Too many auto-mapped pages ({})",
+                    data.mapped_pages
+                );
+                return false;
+            }
+        }
+
         match uc.mem_map(base, 0x1000, Prot::ALL) {
             Ok(_) => true,
             Err(_) => false,
@@ -430,7 +595,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Setup Main Register/Stack
     let stack_top = STACK_BASE + STACK_SIZE_MAIN;
     // JNI_OnLoad @ 0x62ed1c (From Symbol Table)
-    let entry = BASE_ADDR + 0x62ed1c;
+    let default_entry = BASE_ADDR + 0x62ed1c;
+    let entry = if let Some(abs) = entry_override {
+        abs
+    } else if let Some(off) = entry_offset_override {
+        BASE_ADDR + off
+    } else {
+        default_entry
+    };
 
     // MOCK JAVAVM
     let jvm_base: u64 = 0x70000000;
@@ -444,14 +616,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     unicorn.mem_write(jvm_vtable + 0x30, &invoke_interface_magic.to_le_bytes())?;
 
     // Pass arguments to JNI_OnLoad
-    unicorn.reg_write(RegisterARM64::X0, jvm_base)?; // vm
-    unicorn.reg_write(RegisterARM64::X1, 0)?; // reserved
-
-    unicorn.reg_write(RegisterARM64::SP, stack_top)?;
-    unicorn.reg_write(RegisterARM64::PC, entry)?;
-    unicorn.reg_write(RegisterARM64::LR, 0x30000000)?; // EXIT MAGIC
-    unicorn.reg_write(RegisterARM64::CPACR_EL1, 0x300000)?; // VFP
-    unicorn.reg_write(RegisterARM64::TPIDR_EL0, HEAP_START + 0x100000)?; // TLS
+    reset_main_thread(&mut unicorn, entry, stack_top, jvm_base)?;
 
     println!("Starting Scheduler Loop...");
 
@@ -486,8 +651,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     e, pc, sp, x0
                 );
                 scan_memory_for_strings(&unicorn);
-                // Mark dead
-                unicorn.get_data_mut().threads[current_idx].status = ThreadStatus::Dead;
+                if unicorn.get_data().ignore_exceptions
+                    && unicorn.get_data().exception_skip_count < unicorn.get_data().exception_skip_limit
+                {
+                    unicorn.get_data_mut().exception_skip_count += 1;
+                    let next_pc = pc.wrapping_add(4);
+                    unicorn.reg_write(RegisterARM64::PC, next_pc)?;
+                    println!(
+                        "[Sched] Ignored exception ({} of {}), advancing PC to {:x}",
+                        unicorn.get_data().exception_skip_count,
+                        unicorn.get_data().exception_skip_limit,
+                        next_pc
+                    );
+                } else {
+                    // Mark dead
+                    unicorn.get_data_mut().threads[current_idx].status = ThreadStatus::Dead;
+                }
+                if unicorn.get_data().auto_restart
+                    && unicorn.get_data().restart_count < unicorn.get_data().restart_limit
+                {
+                    unicorn.get_data_mut().restart_count += 1;
+                    println!(
+                        "[Sched] Auto-restart {} of {}",
+                        unicorn.get_data().restart_count,
+                        unicorn.get_data().restart_limit
+                    );
+                    reset_main_thread(&mut unicorn, entry, stack_top, jvm_base)?;
+                }
             } else {
                 // Success - Check for Exit
                 let final_pc = unicorn.reg_read(RegisterARM64::PC)?;
@@ -496,6 +686,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("[Sched] Thread T{} Finished/Exited (PC=0)", tid);
                     scan_memory_for_strings(&unicorn);
                     unicorn.get_data_mut().threads[current_idx].status = ThreadStatus::Dead;
+                    if unicorn.get_data().auto_restart
+                        && unicorn.get_data().restart_count < unicorn.get_data().restart_limit
+                    {
+                        unicorn.get_data_mut().restart_count += 1;
+                        println!(
+                            "[Sched] Auto-restart {} of {}",
+                            unicorn.get_data().restart_count,
+                            unicorn.get_data().restart_limit
+                        );
+                        reset_main_thread(&mut unicorn, entry, stack_top, jvm_base)?;
+                    }
                 } else {
                     // Save Context
                     let mut ctx = unicorn.context_alloc()?;
@@ -514,6 +715,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             next_idx = (next_idx + 1) % unicorn.get_data().threads.len();
             if next_idx == start_idx {
                 // All dead
+                if unicorn.get_data().auto_restart
+                    && unicorn.get_data().restart_count < unicorn.get_data().restart_limit
+                {
+                    unicorn.get_data_mut().restart_count += 1;
+                    println!(
+                        "[Sched] Auto-restart {} of {}",
+                        unicorn.get_data().restart_count,
+                        unicorn.get_data().restart_limit
+                    );
+                    reset_main_thread(&mut unicorn, entry, stack_top, jvm_base)?;
+                    continue;
+                }
                 println!("[Sched] All threads dead. Exiting.");
                 return Ok(());
             }
@@ -526,6 +739,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("[Status] {} Insts | PC={:x}", total_insts, pc);
         }
 
+        if total_insts > 5_000_000_000 {
+            println!("[Protection] Instruction Limit Reached (5B). Stopping.");
+            break;
+        }
+
         // Loop Exit if All Dead
         if unicorn
             .get_data()
@@ -533,13 +751,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .iter()
             .all(|t| t.status == ThreadStatus::Dead)
         {
+            if unicorn.get_data().auto_restart
+                && unicorn.get_data().restart_count < unicorn.get_data().restart_limit
+            {
+                unicorn.get_data_mut().restart_count += 1;
+                println!(
+                    "[Sched] Auto-restart {} of {}",
+                    unicorn.get_data().restart_count,
+                    unicorn.get_data().restart_limit
+                );
+                reset_main_thread(&mut unicorn, entry, stack_top, jvm_base)?;
+                continue;
+            }
             println!("[Sched] All threads dead. Exiting.");
             break;
-        }
-        total_insts += quantum as u64;
-        if total_insts % 10_000_000 == 0 {
-            let pc = unicorn.reg_read(RegisterARM64::PC).unwrap_or(0);
-            println!("[Status] {} Insts | PC={:x}", total_insts, pc);
         }
     }
 
@@ -549,11 +774,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn handle_import(uc: &mut Unicorn<EmulatorState>, name: &str) {
     if name.contains("malloc") {
         let size = uc.reg_read(RegisterARM64::X0).unwrap_or(0);
+        
+        // Handle malloc(-1) or other invalid sizes (treat as error)
+        if size > 0x10000000 {  // >256MB is suspicious
+            println!("[Warning] Suspicious malloc size: {} (0x{:x}). Returning NULL.", size, size);
+            uc.reg_write(RegisterARM64::X0, 0).unwrap();
+            return;
+        }
+
         let heap = uc.get_data().heap_ptr;
         let aligned_size = (size + 7) & !7;
+
+        if size > 0x100000 {
+            // Log > 1MB
+            println!("[Warning] Large malloc: {} bytes", size);
+        }
+
+        if heap + aligned_size > HEAP_START + 0x100000000 {
+            // 4GB limit - return NULL instead of crashing
+            println!("[Protection] OOM Prevention: Heap would exceed 4GB. Returning NULL.");
+            uc.reg_write(RegisterARM64::X0, 0).unwrap();
+            return;
+        }
+
+        println!("[Import] malloc({}): {:x}", size, heap);
         uc.reg_write(RegisterARM64::X0, heap).unwrap();
         uc.get_data_mut().heap_ptr += aligned_size;
     } else if name.contains("pthread_create") {
+        if uc.get_data().threads.len() >= 32 {
+            println!("[Protection] Thread Limit Exceeded (32). Failing pthread_create.");
+            uc.reg_write(RegisterARM64::X0, 11).unwrap(); // EAGAIN
+            return;
+        }
         // X0=ptr_tid, X1=attr, X2=routine, X3=arg
         let routine = uc.reg_read(RegisterARM64::X2).unwrap();
         let arg = uc.reg_read(RegisterARM64::X3).unwrap();
@@ -640,34 +892,276 @@ fn handle_import(uc: &mut Unicorn<EmulatorState>, name: &str) {
         let fmt_ptr = uc.reg_read(RegisterARM64::X2).unwrap();
         let tag = read_string(uc, tag_ptr);
         let fmt = read_string(uc, fmt_ptr);
-        println!("[LogPrint] {}: {} (Args not parsed)", tag, fmt);
+
+        // Try to read common log arguments (X3, X4, X5)
+        let x3 = uc.reg_read(RegisterARM64::X3).unwrap_or(0);
+        let x4 = uc.reg_read(RegisterARM64::X4).unwrap_or(0);
+        let x5 = uc.reg_read(RegisterARM64::X5).unwrap_or(0);
+
+        let mut msg = format!("[LogPrint] {}: {}", tag, fmt);
+        if fmt.contains("%s") || fmt.contains("%p") {
+            let s3 = if x3 > 0x1000 {
+                read_string(uc, x3)
+            } else {
+                format!("{:x}", x3)
+            };
+            let s4 = if x4 > 0x1000 {
+                read_string(uc, x4)
+            } else {
+                format!("{:x}", x4)
+            };
+            msg = format!("{} (Arg1: {}, Arg2: {})", msg, s3, s4);
+        } else {
+            msg = format!("{} (Args: {:x}, {:x}, {:x})", msg, x3, x4, x5);
+        }
+        smart_log(uc, msg);
         uc.reg_write(RegisterARM64::X0, 0).unwrap();
+    } else if name.contains("connect") {
+        // int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen);
+        let addr_ptr = uc.reg_read(RegisterARM64::X1).unwrap();
+        // sockaddr_in for IPv4 (typically 16 bytes)
+        // struct sockaddr_in {
+        //    short sin_family; // 2 bytes
+        //    unsigned short sin_port; // 2 bytes (Big Endian)
+        //    struct in_addr sin_addr; // 4 bytes
+        //    char sin_zero[8];
+        // }
+        // Note: ARM64 is LE, but network fields are BE.
+        if let Ok(data) = uc.mem_read_as_vec(addr_ptr, 16) {
+            let family = u16::from_le_bytes([data[0], data[1]]);
+            if family == 2 {
+                // AF_INET
+                let port = u16::from_be_bytes([data[2], data[3]]);
+                let ip = Ipv4Addr::new(data[4], data[5], data[6], data[7]);
+                smart_log(uc, format!("[Network] Connecting to {}:{}", ip, port));
+            } else {
+                println!("[Network] Connecting to unknown family: {}", family);
+            }
+        }
+        uc.reg_write(RegisterARM64::X0, 0).unwrap();
+    } else if name.contains("__system_property_get") {
+        // int __system_property_get(const char *name, char *value);
+        let name_ptr = uc.reg_read(RegisterARM64::X0).unwrap();
+        let value_ptr = uc.reg_read(RegisterARM64::X1).unwrap();
+        let prop_name = read_string(uc, name_ptr);
+
+        let val = match prop_name.as_str() {
+            "ro.product.model" => "Pixel 7 Pro",
+            "ro.product.brand" => "google",
+            "ro.product.manufacturer" => "Google",
+            "ro.build.version.release" => "13",
+            "ro.build.version.sdk" => "33",
+            _ => "",
+        };
+
+        if !val.is_empty() {
+            println!("[OS] __system_property_get: {} -> {}", prop_name, val);
+            let mut val_bytes = val.as_bytes().to_vec();
+            val_bytes.push(0);
+            uc.mem_write(value_ptr, &val_bytes).unwrap();
+            uc.reg_write(RegisterARM64::X0, val.len() as u64).unwrap();
+        } else {
+            println!(
+                "[OS] __system_property_get: {} (Unknown, returning empty)",
+                prop_name
+            );
+            uc.mem_write(value_ptr, &[0]).unwrap();
+            uc.reg_write(RegisterARM64::X0, 0).unwrap();
+        }
     } else if name.contains("sendto") || name.contains("write") {
         // (fd, buf, len) -> X0, X1, X2
         let buf_ptr = uc.reg_read(RegisterARM64::X1).unwrap();
         let len = uc.reg_read(RegisterARM64::X2).unwrap();
         if len > 0 {
-            if let Ok(data) = uc.mem_read_as_vec(buf_ptr, len as usize) {
+            let max_log = std::cmp::min(len as usize, 256);
+            if let Ok(data) = uc.mem_read_as_vec(buf_ptr, max_log) {
                 // Try UTF-8
                 if let Ok(s) = std::str::from_utf8(&data) {
-                    println!("[Network] Send ({} bytes): {}", len, s);
+                    smart_log(uc, format!("[Network] Send ({} bytes): {}", len, s));
                 } else {
-                    println!(
-                        "[Network] Send ({} bytes): {:02x?}",
-                        len,
-                        &data[..std::cmp::min(data.len(), 50)]
+                    smart_log(
+                        uc,
+                        format!(
+                            "[Network] Send ({} bytes, Binary/Partial): {:02x?}",
+                            len, data
+                        ),
                     );
+                }
+
+                // Keyword check
+                let data_str = String::from_utf8_lossy(&data).to_lowercase();
+                if data_str.contains("leaderboard")
+                    || data_str.contains("rank")
+                    || data_str.contains("top")
+                {
+                    println!("[CRITICAL] Leaderboard pattern detected in network buffer!");
+                }
+                if data_str.contains("live")
+                    || data_str.contains("stream")
+                    || data_str.contains("streamer")
+                    || data_str.contains("room")
+                    || data_str.contains("anchor")
+                    || data_str.contains("popular")
+                    || data_str.contains("hot")
+                {
+                    println!("[CRITICAL] Livestream pattern detected in network buffer!");
                 }
             }
         }
         uc.reg_write(RegisterARM64::X0, len).unwrap(); // Success
+    } else if name.contains("SSL_write") || name.contains("SSL_send") {
+        // int SSL_write(SSL *ssl, const void *buf, int num);
+        // X0=ssl, X1=buf, X2=num
+        let buf_ptr = uc.reg_read(RegisterARM64::X1).unwrap();
+        let len = uc.reg_read(RegisterARM64::X2).unwrap() as usize;
+        
+        if len > 0 && len < 0x100000 {
+            let read_len = std::cmp::min(len, 4096);
+            if let Ok(data) = uc.mem_read_as_vec(buf_ptr, read_len) {
+                println!("\n[NETWORK-SSL] SSL_write {} bytes:", len);
+                
+                // Try UTF-8
+                if let Ok(s) = std::str::from_utf8(&data) {
+                    println!("  Content: {}", s);
+                } else {
+                    println!("  Binary: {:02x?}...", &data[..std::cmp::min(128, data.len())]);
+                }
+                
+                // Check for API patterns - ENHANCED for Qiniu Zeus & Moonton GMS
+                let data_str = String::from_utf8_lossy(&data).to_lowercase();
+                if data_str.contains("zeus") || data_str.contains("shortvideo")
+                    || data_str.contains("qiniu") || data_str.contains("appid")
+                {
+                    println!("  [!!!] QINIU ZEUS API REQUEST [!!!]");
+                    
+                    // Log to file
+                    if let Ok(mut file) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open("livestream_api_requests.log")
+                    {
+                        let _ = writeln!(file, "[SSL_write] Qiniu Zeus Request:");
+                        let _ = writeln!(file, "{}", data_str);
+                        let _ = writeln!(file, "---");
+                    }
+                }
+                
+                // Check for Moonton GMS (Game Management Service) endpoints
+                if data_str.contains("gms") || data_str.contains("moontontech")
+                    || data_str.contains("match") || data_str.contains("streamer")
+                {
+                    println!("  [!!!] MOONTON GAME TELEMETRY API REQUEST [!!!]");
+                    
+                    // Log to file
+                    if let Ok(mut file) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open("game_telemetry_requests.log")
+                    {
+                        let _ = writeln!(file, "[SSL_write] Moonton GMS Request:");
+                        let _ = writeln!(file, "{}", data_str);
+                        let _ = writeln!(file, "---");
+                    }
+                }
+                
+                // Check for standard API patterns
+                if data_str.contains("leaderboard") || data_str.contains("rank")
+                    || data_str.contains("top") || data_str.contains("api")
+                    || data_str.contains("http") || data_str.contains("post")
+                    || data_str.contains("get ")
+                    || data_str.contains("live") || data_str.contains("stream")
+                    || data_str.contains("streamer") || data_str.contains("room")
+                    || data_str.contains("anchor") || data_str.contains("popular")
+                    || data_str.contains("hot") {
+                    println!("  [!!!] POTENTIAL API REQUEST DETECTED [!!!]");
+                }
+            }
+        }
+        uc.reg_write(RegisterARM64::X0, len as u64).unwrap();
+    } else if name.contains("SSL_read") || name.contains("SSL_recv") {
+        // int SSL_read(SSL *ssl, void *buf, int num);
+        let buf_ptr = uc.reg_read(RegisterARM64::X1).unwrap();
+        let max_len = uc.reg_read(RegisterARM64::X2).unwrap() as usize;
+
+        // Emulate live list responses if enabled
+        if uc.get_data().simulate_live_list && uc.get_data().simulate_live_list_remaining > 0 && max_len > 0 {
+            let mut seed = uc.get_data().simulate_seed;
+            let payload = build_fake_live_list_json(&mut seed, std::cmp::min(uc.get_data().simulate_live_list_remaining, 50));
+            uc.get_data_mut().simulate_seed = seed;
+            let bytes = payload.as_bytes();
+            let write_len = std::cmp::min(bytes.len(), max_len);
+            let _ = uc.mem_write(buf_ptr, &bytes[..write_len]);
+            uc.get_data_mut().simulate_live_list_remaining = uc.get_data().simulate_live_list_remaining.saturating_sub(1);
+            println!("[NETWORK-SSL] Emulated live list response ({} bytes)", write_len);
+            uc.reg_write(RegisterARM64::X0, write_len as u64).unwrap();
+            return;
+        }
+
+        // Simulate successful read with dummy data
+        println!("[NETWORK-SSL] SSL_read request for {} bytes (returning 0 - no data)", max_len);
+        
+        // ENHANCEMENT: Try to intercept response at SSL layer
+        // If app writes response data to buf_ptr before calling SSL_read, we can inspect it
+        if max_len > 0 && max_len < 1000000 {
+            let read_len = std::cmp::min(max_len, 8192);
+            if let Ok(potential_response) = uc.mem_read_as_vec(buf_ptr, read_len) {
+                let response_str = String::from_utf8_lossy(&potential_response);
+                
+                // Check for Zeus API or livestream responses
+                if response_str.contains("zeus") || response_str.contains("shortvideo") 
+                    || response_str.contains("qiniu") || response_str.contains("live")
+                    || response_str.contains("stream") || response_str.contains("category")
+                    || response_str.contains("room_id") || response_str.contains("anchor")
+                {
+                    println!("\n[!!!] POTENTIAL QINIU/LIVESTREAM RESPONSE DETECTED [!!!]");
+                    println!("[Response] {} bytes:", read_len);
+                    println!("{}", response_str);
+                    
+                    // Log to file
+                    if let Ok(mut file) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open("livestream_responses.log")
+                    {
+                        let _ = writeln!(file, "[SSL_read] Response captured:");
+                        let _ = writeln!(file, "{}", response_str);
+                        let _ = writeln!(file, "---");
+                    }
+                }
+                
+                // Check for Moonton GMS game telemetry responses
+                if response_str.contains("gms") || response_str.contains("moontontech")
+                    || response_str.contains("hero") || response_str.contains("item")
+                    || response_str.contains("emblem") || response_str.contains("kda")
+                    || response_str.contains("match_id") || response_str.contains("streamer_id")
+                    || response_str.contains("game_state") || response_str.contains("picks")
+                {
+                    println!("\n[!!!] MOONTON GAME TELEMETRY RESPONSE DETECTED [!!!]");
+                    println!("[Response] {} bytes:", read_len);
+                    println!("{}", response_str);
+                    
+                    // Log to file
+                    if let Ok(mut file) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open("game_telemetry_responses.log")
+                    {
+                        let _ = writeln!(file, "[SSL_read] Game Telemetry Response:");
+                        let _ = writeln!(file, "{}", response_str);
+                        let _ = writeln!(file, "---");
+                    }
+                }
+            }
+        }
+        
+        uc.reg_write(RegisterARM64::X0, 0).unwrap(); // No data available
     } else if name.contains("dlclose") {
         uc.reg_write(RegisterARM64::X0, 0).unwrap();
     }
 }
 
 fn handle_jni(uc: &mut Unicorn<EmulatorState>, idx: u64) {
-    println!("[JNI] Call {} (Offset {:x})", idx, idx * 8);
+    smart_log(uc, format!("[JNI] Call {} (Offset {:x})", idx, idx * 8));
 
     // Default Success (0)
     let mut retval = 0;
@@ -677,7 +1171,7 @@ fn handle_jni(uc: &mut Unicorn<EmulatorState>, idx: u64) {
         let _env = uc.reg_read(RegisterARM64::X0).unwrap();
         let name_ptr = uc.reg_read(RegisterARM64::X1).unwrap();
         let name = read_string(uc, name_ptr);
-        println!("[JNI] FindClass: {}", name);
+        smart_log(uc, format!("[JNI] FindClass: {}", name));
         retval = 0xDEADBEEF; // Dummy Class Object
     } else if idx == 33 || idx == 113 {
         // GetMethodID / GetStaticMethodID
@@ -687,7 +1181,7 @@ fn handle_jni(uc: &mut Unicorn<EmulatorState>, idx: u64) {
         let sig_ptr = uc.reg_read(RegisterARM64::X3).unwrap();
         let name = read_string(uc, name_ptr);
         let sig = read_string(uc, sig_ptr);
-        println!("[JNI] GetMethodID ({}): {} {}", idx, name, sig);
+        smart_log(uc, format!("[JNI] GetMethodID ({}): {} {}", idx, name, sig));
         retval = 0xCAFEBABE; // Dummy Method ID
     } else if idx == 34 {
         // CallObjectMethod (env, obj, mid, args...)
@@ -699,38 +1193,45 @@ fn handle_jni(uc: &mut Unicorn<EmulatorState>, idx: u64) {
         // We can check if pointer is in Heap or near String ranges?
         // Or just try reading it (safe read).
         let maybe_str = read_string(uc, arg1_ptr);
-        println!("[JNI] CallObjectMethod (34): Arg1='{}'", maybe_str);
+        smart_log(
+            uc,
+            format!("[JNI] CallObjectMethod (34): Arg1='{}'", maybe_str),
+        );
 
         // Return 0xDEADBEEF (Dummy Class)
         // Return 0xDEADBEEF (Dummy Class)
         retval = 0xDEADBEEF;
     } else if idx == 115 {
-        println!("[JNI] CallStaticObjectMethod (115) - Returning Dummy ClassLoader");
+        smart_log(
+            uc,
+            " [JNI] CallStaticObjectMethod (115) - Returning Dummy ClassLoader".to_string(),
+        );
         retval = 0x88888888;
     } else if idx == 21 {
         // NewGlobalRef (env, obj) -> obj
         // Return input object as "Ref"
         let obj = uc.reg_read(RegisterARM64::X1).unwrap();
-        println!("[JNI] NewGlobalRef (21): {:x}", obj);
+        smart_log(uc, format!("[JNI] NewGlobalRef (21): {:x}", obj));
         retval = obj;
     } else if idx == 167 {
         // NewStringUTF (env, bytes)
         let bytes_ptr = uc.reg_read(RegisterARM64::X1).unwrap();
         let s = read_string(uc, bytes_ptr);
-        println!("[JNI] NewStringUTF (167): '{}'", s);
-        // Return dummy string object?
-        println!("[JNI] NewStringUTF (167): '{}'", s);
+        smart_log(uc, format!("[JNI] NewStringUTF (167): '{}'", s));
         // Return dummy string object?
         retval = 0x99999999;
     } else if idx == 169 {
         // GetStringUTFChars (env, string, isCopy)
         let string_ptr = uc.reg_read(RegisterARM64::X1).unwrap();
-        println!("[JNI] GetStringUTFChars (169): Object {:x}", string_ptr);
+        smart_log(
+            uc,
+            format!("[JNI] GetStringUTFChars (169): Object {:x}", string_ptr),
+        );
         // We assume the object pointer IS the string path for our mocks
         retval = string_ptr;
     } else if idx == 170 {
         // ReleaseStringUTFChars
-        println!("[JNI] ReleaseStringUTFChars (170)");
+        smart_log(uc, "[JNI] ReleaseStringUTFChars (170)".to_string());
         retval = 0;
     } else if idx == 215 {
         // RegisterNatives
@@ -750,6 +1251,31 @@ fn handle_jni(uc: &mut Unicorn<EmulatorState>, idx: u64) {
     }
 
     uc.reg_write(RegisterARM64::X0, retval).unwrap();
+}
+
+fn smart_log(uc: &mut Unicorn<EmulatorState>, msg: String) {
+    let mut exit_flag = false;
+    {
+        let data = uc.get_data_mut();
+        if data.last_log == msg {
+            data.log_count += 1;
+        } else {
+            data.last_log = msg.clone();
+            data.log_count = 1;
+        }
+        if data.log_count >= 50 {
+            println!(
+                "{}\n[Protection] Force stopping due to 5 consecutive identical outputs.",
+                msg
+            );
+            exit_flag = true;
+        } else {
+            println!("{}", msg);
+        }
+    }
+    if exit_flag {
+        std::process::exit(0);
+    }
 }
 
 fn read_string(uc: &Unicorn<EmulatorState>, addr: u64) -> String {
