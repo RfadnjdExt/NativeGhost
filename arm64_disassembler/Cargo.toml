@@ -1,0 +1,86 @@
+[package]
+name = "arm64_disassembler"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+goblin = "0.8"
+
+[[bin]]
+name = "fast_search"
+path = "src/bin/fast_search.rs"
+
+[[bin]]
+name = "full_analysis"
+path = "src/bin/full_analysis.rs"
+
+[[bin]]
+name = "advanced_analysis"
+path = "src/bin/advanced_analysis.rs"
+
+[[bin]]
+name = "deep_analysis"
+path = "src/bin/deep_analysis.rs"
+
+[[bin]]
+name = "disassemble_functions"
+path = "src/bin/disassemble_functions.rs"
+
+[[bin]]
+name = "phase2_analyzer"
+path = "src/bin/phase2_analyzer.rs"
+
+[[bin]]
+name = "string_extractor"
+path = "src/bin/string_extractor.rs"
+
+[[bin]]
+name = "call_chain_tracer"
+path = "src/bin/call_chain_tracer.rs"
+
+[[bin]]
+name = "bulk_analyzer"
+path = "src/bin/bulk_analyzer.rs"
+
+[[bin]]
+name = "deep_manual_analyzer"
+path = "src/bin/deep_manual_analyzer.rs"
+
+[[bin]]
+name = "manual_disassembler"
+path = "src/bin/manual_disassembler.rs"
+
+[[bin]]
+name = "advanced_disassembler"
+path = "src/bin/advanced_disassembler.rs"
+[[bin]]
+name = "full_function_extractor"
+path = "src/bin/full_function_extractor.rs"
+[[bin]]
+name = "phase4_extractor"
+path = "src/bin/phase4_extractor.rs"
+
+[[bin]]
+name = "protocol_analyzer"
+path = "src/bin/protocol_analyzer.rs"
+
+[[bin]]
+name = "api_endpoint_discovery"
+path = "src/bin/api_endpoint_discovery.rs"
+
+[[bin]]
+name = "request_builder"
+path = "src/bin/request_builder.rs"
+
+[[bin]]
+name = "encryption_key_extractor"
+path = "src/bin/encryption_key_extractor.rs"
+
+[[bin]]
+name = "game_api_client"
+path = "src/bin/game_api_client.rs"
+
+[[bin]]
+name = "memory_dump_builder"
+path = "src/bin/memory_dump_builder.rs"
